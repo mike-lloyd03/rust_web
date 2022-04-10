@@ -1,8 +1,13 @@
+use axum::body::{boxed, Body};
+use axum::http::{Response, StatusCode};
 use axum::{response::IntoResponse, routing::get, Router};
 use clap::Parser;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::str::FromStr;
-use tower::ServiceBuilder;
+use tokio::fs;
+use tower::{ServiceBuilder, ServiceExt};
+use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 #[derive(Parser, Debug)]
@@ -19,6 +24,10 @@ struct Opt {
     /// Port to serve the app from
     #[clap(short, long, default_value = "8080")]
     port: u16,
+
+    /// Directory where static content is located
+    #[clap(long, default_value = "../dist")]
+    static_dir: String,
 }
 
 #[tokio::main]
@@ -31,7 +40,35 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let app = Router::new()
-        .route("/", get(hello))
+        .route("/api/hello", get(hello))
+        .fallback(get(|req| async move {
+            match ServeDir::new(&opt.static_dir).oneshot(req).await {
+                Ok(res) => match res.status() {
+                    StatusCode::NOT_FOUND => {
+                        let index_path = PathBuf::from(&opt.static_dir).join("index.html");
+
+                        let index_content = match fs::read_to_string(index_path).await {
+                            Ok(index_content) => index_content,
+                            Err(_) => {
+                                return Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(boxed(Body::from("index file not found")))
+                                    .unwrap()
+                            }
+                        };
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(boxed(Body::from(index_content)))
+                            .unwrap()
+                    }
+                    _ => res.map(boxed),
+                },
+                Err(err) => Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(boxed(Body::from(format!("error: {err}"))))
+                    .expect("error response"),
+            }
+        }))
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()));
 
     let sock_addr = SocketAddr::from((
